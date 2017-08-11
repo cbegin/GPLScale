@@ -67,7 +67,7 @@
 #include <housekeeper.h>
 #include <mysql.h>
 
-#define GW_MYSQL_VERSION "5.5.5-10.0.0 "MAXSCALE_VERSION"-maxscale"
+#define GW_MYSQL_VERSION "5.5.5-10.0.0 " MAXSCALE_VERSION "-maxscale"
 #define GW_MYSQL_LOOP_TIMEOUT 300000000
 #define GW_MYSQL_READ 0
 #define GW_MYSQL_WRITE 1
@@ -89,6 +89,8 @@
 #ifndef MYSQL_SCRAMBLE_LEN
 # define MYSQL_SCRAMBLE_LEN GW_MYSQL_SCRAMBLE_SIZE
 #endif
+
+#define MYSQL_HOSTNAME_MAXLEN  60
 
 #define GW_NOINTR_CALL(A)       do { errno = 0; A; } while (errno == EINTR)
 #define SMALL_CHUNK 1024

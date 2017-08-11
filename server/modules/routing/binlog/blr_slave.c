@@ -60,7 +60,8 @@
  *                                  the period set during registration is checked
  *                                  and heartbeat event might be sent to the affected slave.
  * 25/09/2015   Martin Brampton     Block callback processing when no router session in the DCB
- * 23/10/15 Markus Makela           Added current_safe_event
+ * 23/10/2015   Markus Makela       Added current_safe_event
+ * 09/05/2016   Massimiliano Pinto  Added SELECT USER()
  *
  * @endverbatim
  */
@@ -85,6 +86,7 @@
 #include <version.h>
 #include <zlib.h>
 
+static char* get_next_token(char *str, const char* delim, char **saveptr);
 extern int load_mysql_users(SERVICE *service);
 extern int blr_save_dbusers(ROUTER_INSTANCE *router);
 extern void blr_master_close(ROUTER_INSTANCE* router);
@@ -287,7 +289,7 @@ blr_slave_request(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, GWBUF *queue)
  * order to support some commands that are useful for monitoring the binlog
  * router.
  *
- * Twelve select statements are currently supported:
+ * Thirteen select statements are currently supported:
  *  SELECT UNIX_TIMESTAMP();
  *  SELECT @master_binlog_checksum
  *  SELECT @@GLOBAL.GTID_MODE
@@ -300,6 +302,7 @@ blr_slave_request(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, GWBUF *queue)
  *  SELECT @@[GLOBAL.]server_id
  *  SELECT @@version
  *  SELECT @@[GLOBAL.]server_uuid
+ *  SELECT USER()
  *
  * Eight show commands are supported:
  *  SHOW [GLOBAL] VARIABLES LIKE 'SERVER_ID'
@@ -311,12 +314,13 @@ blr_slave_request(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, GWBUF *queue)
  *  SHOW WARNINGS
  *  SHOW [GLOBAL] STATUS LIKE 'Uptime'
  *
- * Six set commands are supported:
+ * Seven set commands are supported:
  *  SET @master_binlog_checksum = @@global.binlog_checksum
  *  SET @master_heartbeat_period=...
  *  SET @slave_slave_uuid=...
  *  SET NAMES latin1
  *  SET NAMES utf8
+ *  SET NAMES XXX
  *  SET mariadb_slave_capability=...
  *
  * Four administrative commands are supported:
@@ -427,6 +431,18 @@ blr_slave_query(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, GWBUF *queue)
             {
                 return blr_slave_replay(router, slave, router->saved_master.selectver);
             }
+        }
+        else if (strcasecmp(word, "USER()") == 0)
+        {
+            /* Return user@host */
+            char user_host[MYSQL_USER_MAXLEN + 1 + MYSQL_HOSTNAME_MAXLEN + 1] = "";
+
+            free(query_text);
+            snprintf(user_host, sizeof(user_host),
+                     "%s@%s", slave->dcb->user, slave->dcb->remote);
+
+            return blr_slave_send_var_value(router, slave, "USER()",
+                                            user_host, BLR_TYPE_STRING);
         }
         else if (strcasecmp(word, "@@version") == 0)
         {
@@ -694,6 +710,12 @@ blr_slave_query(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, GWBUF *queue)
         {
             MXS_ERROR("%s: Incomplete set command.", router->service->name);
         }
+        else if ((strcasecmp(word, "autocommit") == 0) || (strcasecmp(word, "@@session.autocommit") == 0))
+        {
+            /* return OK */
+            free(query_text);
+            return blr_slave_send_ok(router, slave);
+        }
         else if (strcasecmp(word, "@master_heartbeat_period") == 0)
         {
             int slave_heartbeat;
@@ -792,6 +814,11 @@ blr_slave_query(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, GWBUF *queue)
                 free(query_text);
                 return blr_slave_replay(router, slave, router->saved_master.utf8);
             }
+            else
+            {
+                free(query_text);
+                return blr_slave_send_ok(router, slave);
+            }
         }
     } /* RESET current configured master */
     else if (strcasecmp(query_text, "RESET") == 0)
@@ -856,9 +883,15 @@ blr_slave_query(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, GWBUF *queue)
 
                 spinlock_acquire(&router->lock);
 
+                /* Set the BLRM_UNCONFIGURED state */
                 router->master_state = BLRM_UNCONFIGURED;
                 blr_master_set_empty_config(router);
                 blr_master_free_config(current_master);
+
+                /* Remove any error message and errno */
+                free(router->m_errmsg);
+                router->m_errmsg = NULL;
+                router->m_errno = 0;
 
                 spinlock_release(&router->lock);
 
@@ -1006,11 +1039,19 @@ blr_slave_query(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, GWBUF *queue)
                         router->master_state = BLRM_SLAVE_STOPPED;
 
                         spinlock_release(&router->lock);
-                    }
 
-                    if (!router->trx_safe)
-                    {
+                        /*
+                         * The binlog server has just been configured
+                         * master.ini file written in router->binlogdir.
+                         * Now create the binlogfile specified in MASTER_LOG_FILE
+                         */
+
+                        if (blr_file_new_binlog(router, router->binlog_name))
+                        {
+                            MXS_INFO("%s: 'master.ini' created, binlog file '%s' created", router->service->name, router->binlog_name);
+                        }
                         blr_master_free_config(current_master);
+                        return blr_slave_send_ok(router, slave);
                     }
 
                     if (router->trx_safe && router->pending_transaction)
@@ -1026,17 +1067,24 @@ blr_slave_query(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, GWBUF *queue)
 
                             return blr_slave_send_warning_message(router, slave, message);
                         }
-                        else
-                        {
-                            blr_master_free_config(current_master);
-                            return blr_slave_send_ok(router, slave);
-                        }
+                    }
 
-                    }
-                    else
+                    blr_master_free_config(current_master);
+
+                    /*
+                     * The CHAMGE MASTER command might specify a new binlog file.
+                     * Let's create the binlogfile specified in MASTER_LOG_FILE
+                     */
+
+                    if (strlen(router->prevbinlog) && strcmp(router->prevbinlog, router->binlog_name))
                     {
-                        return blr_slave_send_ok(router, slave);
-                    }
+                        if (blr_file_new_binlog(router, router->binlog_name))
+                        {
+                            MXS_INFO("%s: created new binlog file '%s' by 'CHANGE MASTER TO' command",
+                                     router->service->name, router->binlog_name);
+                        }
+                     }
+                     return blr_slave_send_ok(router, slave);
                 }
             }
         }
@@ -2508,8 +2556,7 @@ blr_slave_catchup(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, bool large)
         if (slave->binlog_pos >= blr_file_size(file)
             && router->rotating == 0
             && strcmp(router->binlog_name, slave->binlogfile) != 0
-            && (blr_master_connected(router)
-                || blr_file_next_exists(router, slave)))
+            && blr_file_next_exists(router, slave))
         {
             /* We may have reached the end of file of a non-current
              * binlog file.
@@ -2547,7 +2594,7 @@ blr_slave_catchup(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, bool large)
                 dcb_close(slave->dcb);
             }
         }
-        else if (blr_master_connected(router))
+        else
         {
             spinlock_acquire(&slave->catch_lock);
             slave->cstate |= CS_EXPECTCB;
@@ -3338,7 +3385,6 @@ blr_stop_slave(ROUTER_INSTANCE* router, ROUTER_SLAVE* slave)
 static int
 blr_start_slave(ROUTER_INSTANCE* router, ROUTER_SLAVE* slave)
 {
-    char path[PATH_MAX + 1] = "";
     int loaded;
 
     /* if unconfigured return an error */
@@ -3418,24 +3464,23 @@ blr_start_slave(ROUTER_INSTANCE* router, ROUTER_SLAVE* slave)
             /* Send warning message to mysql command */
             blr_slave_send_warning_message(router, slave, msg);
         }
+    }
 
-        /* create new one */
+    /* No file has beem opened, create a new binlog file */
+    if (router->binlog_fd == -1)
+    {
         blr_file_new_binlog(router, router->binlog_name);
     }
     else
     {
-        if (router->binlog_fd == -1)
-        {
-            /* create new one */
-            blr_file_new_binlog(router, router->binlog_name);
-        }
-        else
-        {
-            /* use existing one */
-            blr_file_use_binlog(router, router->binlog_name);
-        }
+        /* A new binlog file has been created by CHANGE MASTER TO
+         * if no pending transaction is detected.
+         * use the existing one.
+         */
+        blr_file_use_binlog(router, router->binlog_name);
     }
 
+    /* Start the replication from Master server */
     blr_start_master(router);
 
     MXS_NOTICE("%s: START SLAVE executed by %s@%s. Trying connection to master %s:%d, "
@@ -3448,27 +3493,25 @@ blr_start_slave(ROUTER_INSTANCE* router, ROUTER_SLAVE* slave)
                router->binlog_name,
                router->current_pos, router->binlog_position);
 
-    /* File path for router cached authentication data */
-    strcpy(path, router->binlogdir);
-    strncat(path, "/cache", PATH_MAX);
+    /* Try reloading new users and update cached credentials */
+    loaded = service_refresh_users(router->service);
 
-    strncat(path, "/dbusers", PATH_MAX);
-
-    /* Try loading dbusers from configured backends */
-    loaded = load_mysql_users(router->service);
-
-    if (loaded < 0)
+    if (loaded ==  0)
     {
-        MXS_ERROR("Unable to load users for service %s",
-                  router->service->name);
+        blr_save_dbusers(router);
     }
     else
     {
-        /* update cached data */
-        if (loaded > 0)
-        {
-            blr_save_dbusers(router);
-        }
+        char path[PATH_MAX + 1] = "";
+        /* File path for router cached authentication data */
+        strcpy(path, router->binlogdir);
+        strncat(path, "/cache", PATH_MAX);
+        strncat(path, "/dbusers", PATH_MAX);
+
+        MXS_NOTICE("Service %s: user credentials could not be refreshed. "
+                    "Will use existing cached credentials (%s) if possible.",
+                    router->service->name,
+                    path);
     }
 
     return blr_slave_send_ok(router, slave);
@@ -4260,6 +4303,148 @@ blr_set_master_password(ROUTER_INSTANCE *router, char *password)
 }
 
 /**
+ * Get next token
+ *
+ * Works exactly like strtok_t except that a delim character which appears
+ * anywhere within quotes is ignored. For instance, if delim is "," then
+ * a string like "MASTER_USER='maxscale_repl_user',MASTER_PASSWORD='a,a'"
+ * will be tokenized into the following two tokens:
+ *
+ *   MASTER_USER='maxscale_repl_user'
+ *   MASTER_PASSWORD='a,a'
+ *
+ * @see strtok_r
+ */
+static char* get_next_token(char *str, const char* delim, char **saveptr)
+{
+    if (str)
+    {
+        *saveptr = str;
+    }
+
+    if (!*saveptr)
+    {
+        return NULL;
+    }
+
+    bool delim_found = true;
+
+    // Skip any delims in the beginning.
+    while (**saveptr && delim_found)
+    {
+        const char* d = delim;
+
+        while (*d)
+        {
+            if (*d == **saveptr)
+            {
+                break;
+            }
+
+            ++d;
+        }
+
+        if (*d == 0)
+        {
+            delim_found = false;
+        }
+        else
+        {
+            ++*saveptr;
+        }
+    }
+
+    if (!**saveptr)
+    {
+        return NULL;
+    }
+
+    delim_found = false;
+
+    char *token = *saveptr;
+    char *p = *saveptr;
+
+    char quote = 0;
+
+    while (*p && !delim_found)
+    {
+        switch (*p)
+        {
+        case '\'':
+        case '"':
+        case '`':
+            if (!quote)
+            {
+                quote = *p;
+            }
+            else if (quote == *p)
+            {
+                quote = 0;
+            }
+            break;
+
+        default:
+            if (!quote)
+            {
+                const char *d = delim;
+                while (*d && !delim_found)
+                {
+                    if (*p == *d)
+                    {
+                        delim_found = true;
+                        *p = 0;
+                    }
+                    else
+                    {
+                        ++d;
+                    }
+                }
+            }
+        }
+
+        ++p;
+    }
+
+    if (*p == 0)
+    {
+        *saveptr = NULL;
+    }
+    else if (delim_found)
+    {
+        *saveptr = p;
+
+        delim_found = true;
+
+        while (**saveptr && delim_found)
+        {
+            const char *d = delim;
+            while (*d)
+            {
+                if (**saveptr == *d)
+                {
+                    break;
+                }
+                else
+                {
+                    ++d;
+                }
+            }
+
+            if (*d == 0)
+            {
+                delim_found = false;
+            }
+            else
+            {
+                ++*saveptr;
+            }
+        }
+    }
+
+    return token;
+}
+
+/**
  * Parse a CHANGE MASTER TO SQL command
  *
  * @param input     The command to be parsed
@@ -4273,7 +4458,7 @@ blr_parse_change_master_command(char *input, char *error_string, CHANGE_MASTER_O
     char *sep = ",";
     char *word, *brkb;
 
-    if ((word = strtok_r(input, sep, &brkb)) == NULL)
+    if ((word = get_next_token(input, sep, &brkb)) == NULL)
     {
         sprintf(error_string, "Unable to parse query [%s]", input);
         return 1;
@@ -4287,7 +4472,7 @@ blr_parse_change_master_command(char *input, char *error_string, CHANGE_MASTER_O
         }
     }
 
-    while ((word = strtok_r(NULL, sep, &brkb)) != NULL)
+    while ((word = get_next_token(NULL, sep, &brkb)) != NULL)
     {
         /* parse options key=val */
         if (blr_handle_change_master_token(word, error_string, config))
@@ -4311,12 +4496,12 @@ static int
 blr_handle_change_master_token(char *input, char *error, CHANGE_MASTER_OPTIONS *config)
 {
     /* space+TAB+= */
-    char *sep = " 	=";
+    char *sep = " \t=";
     char *word, *brkb;
     char *value = NULL;
     char **option_field = NULL;
 
-    if ((word = strtok_r(input, sep, &brkb)) == NULL)
+    if ((word = get_next_token(input, sep, &brkb)) == NULL)
     {
         sprintf(error, "error parsing %s", brkb);
         return 1;
@@ -4355,7 +4540,7 @@ static char *
 blr_get_parsed_command_value(char *input)
 {
     /* space+TAB+= */
-    char *sep = "	 =";
+    char *sep = " \t=";
     char *ret = NULL;
     char *word;
     char *value = NULL;
@@ -4369,7 +4554,7 @@ blr_get_parsed_command_value(char *input)
         return ret;
     }
 
-    if ((word = strtok_r(NULL, sep, &input)) != NULL)
+    if ((word = get_next_token(NULL, sep, &input)) != NULL)
     {
         char *ptr;
 
