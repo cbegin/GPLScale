@@ -1,4 +1,5 @@
-# GPLScale - a GPL fork of MaxScale by MariaDB Corporation (now under BSL license)
+# GPLScale
+### A GPL fork of MaxScale by MariaDB Corporation (now under BSL license)
 see: http://swanhart.livejournal.com/140324.html
 
 The  GPLScale is an intelligent proxy that allows
