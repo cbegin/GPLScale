@@ -2,23 +2,32 @@ FROM centos:7
 
 COPY MariaDB.repo /etc/yum.repos.d/MariaDB.repo
 
+# Install Prerequisites
+RUN yum install -y epel-release
 RUN yum update -y
-
 RUN yum install -y lsb
-
 RUN yum install -y gcc gcc-c++ ncurses-devel bison flex glibc-devel cmake libgcc perl make libtool \
     openssl-devel libaio libaio-devel librabbitmq-devel libcurl-devel pcre-devel rpm-build libedit-devel \
     git xz-devel
-
 RUN yum install -y mariadb-server
 RUN yum install -y mariadb-devel
-
 RUN git clone https://github.com/cbegin/GPLScale.git
 
+# Install P
+RUN mkdir -p /GPLScale/pcre2/build
+WORKDIR /GPLScale/pcre2/build
+RUN cmake .. -DCMAKE_C_FLAGS=-fPIC -DBUILD_SHARED_LIBS=N -DPCRE2_BUILD_PCRE2GREP=N  -DPCRE2_BUILD_TESTS=N && echo $?
+RUN make && echo $?
+RUN make install && echo $?
+
 RUN mkdir -p /GPLScale/build
-
 WORKDIR /GPLScale/build
+RUN cmake .. -DPACKAGE=Y && echo $?
+RUN make && echo $?
+RUN make install && echo $?
 
+RUN make testcore
 
+RUN make package
 
-
+VOLUME /rpm
