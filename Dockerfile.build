@@ -19,6 +19,16 @@ RUN mkdir -p /GPLScale/build
 
 WORKDIR /GPLScale/build
 
+RUN cmake -DPACKAGE=Y ..
 
+RUN make
 
+RUN make testcore
 
+RUN make package
+
+RUN mkdir /packages && \
+    mv maxscale*.rpm /packages && \
+    mv maxscale*.tar.gz /packages
+
+VOLUME /dist
