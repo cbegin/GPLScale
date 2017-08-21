@@ -13,29 +13,26 @@ RUN yum install -y mariadb-server
 RUN yum install -y mariadb-devel
 RUN git clone https://github.com/cbegin/GPLScale.git
 
-# Install P
+# Install PCRE2
 RUN mkdir -p /GPLScale/pcre2/build
 WORKDIR /GPLScale/pcre2/build
-RUN cmake .. -DCMAKE_C_FLAGS=-fPIC -DBUILD_SHARED_LIBS=N -DPCRE2_BUILD_PCRE2GREP=N  -DPCRE2_BUILD_TESTS=N && echo $?
-RUN make && echo $?
-RUN make install && echo $?
+RUN cmake .. -DCMAKE_C_FLAGS=-fPIC -DBUILD_SHARED_LIBS=N -DPCRE2_BUILD_PCRE2GREP=N  -DPCRE2_BUILD_TESTS=N
+RUN make
+RUN make install
 
+# Install MaxScale
 RUN mkdir -p /GPLScale/build
 WORKDIR /GPLScale/build
-RUN cmake .. -DPACKAGE=Y && echo $?
-RUN make && echo $?
-RUN make install && echo $?
-
-RUN cmake -DPACKAGE=Y ..
-
+RUN cmake .. -DPACKAGE=Y
 RUN make
+RUN make install
 
+# Test MaxScale
 RUN make testcore
 
+# Package MaxScale
 RUN make package
-
 RUN mkdir /packages && \
     mv maxscale*.rpm /packages && \
     mv maxscale*.tar.gz /packages
 
-VOLUME /dist
